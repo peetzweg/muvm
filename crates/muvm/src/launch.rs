@@ -3,8 +3,10 @@ use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use rustix::fs::{flock, FlockOperation};
@@ -12,12 +14,20 @@ use rustix::fs::{flock, FlockOperation};
 use crate::env::prepare_env_vars;
 use crate::tty::{run_io_host, RawTerminal};
 use crate::utils::launch::Launch;
+use log::debug;
 use nix::unistd::unlink;
 use std::ops::Range;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::ExitCode;
 
 pub const DYNAMIC_PORT_RANGE: Range<u32> = 50000..50200;
+
+/// How long to keep trying to reach the server of a VM that holds the lock.
+/// The VM may still be booting (the server socket doesn't exist or the guest
+/// isn't listening yet) or shutting down (the socket is gone but the VMM
+/// process hasn't released the lock yet).
+const LAUNCH_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+const LAUNCH_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
 
 pub enum LaunchResult {
     LaunchRequested(ExitCode),
@@ -124,42 +134,45 @@ pub fn launch_or_lock(
     tty: bool,
     privileged: bool,
 ) -> Result<LaunchResult> {
-    let lock_file = lock_file()?;
-    match lock_file {
-        Some(lock_file) => Ok(LaunchResult::LockAcquired {
-            lock_file,
-            command,
-            command_args,
-            env,
-        }),
-        None => {
-            let env = prepare_env_vars(env)?;
-            let mut tries = 0;
-            loop {
-                match wrapped_launch(
-                    command.clone(),
-                    command_args.clone(),
-                    env.clone(),
-                    interactive,
-                    tty,
-                    privileged,
-                ) {
-                    Err(err) => match err.downcast_ref::<LaunchError>() {
-                        Some(&LaunchError::Connection(_)) => {
-                            if tries == 3 {
-                                return Err(anyhow!("could not request launch to server: {err}"));
-                            } else {
-                                tries += 1;
-                            }
-                        },
-                        _ => {
-                            return Err(anyhow!("could not request launch to server: {err}"));
-                        },
-                    },
-                    Ok(code) => return Ok(LaunchResult::LaunchRequested(code)),
-                }
-            }
-        },
+    let deadline = Instant::now() + LAUNCH_RETRY_TIMEOUT;
+    let mut delay = Duration::from_millis(10);
+    let mut prepared_env = None;
+    loop {
+        // Check the lock on every attempt: if the VM that held it has exited
+        // in the meantime, we become the new VM instead of retrying against a
+        // server that is gone for good.
+        if let Some(lock_file) = lock_file()? {
+            return Ok(LaunchResult::LockAcquired {
+                lock_file,
+                command,
+                command_args,
+                env,
+            });
+        }
+        let launch_env = match prepared_env {
+            Some(ref launch_env) => launch_env,
+            None => prepared_env.insert(prepare_env_vars(env.clone())?),
+        };
+        match wrapped_launch(
+            command.clone(),
+            command_args.clone(),
+            launch_env.clone(),
+            interactive,
+            tty,
+            privileged,
+        ) {
+            Err(err) => match err.downcast_ref::<LaunchError>() {
+                Some(&LaunchError::Connection(_)) if Instant::now() < deadline => {
+                    debug!(err:%; "muvm server not reachable, retrying in {delay:?}");
+                    thread::sleep(delay);
+                    delay = (delay * 2).min(LAUNCH_RETRY_MAX_DELAY);
+                },
+                _ => {
+                    return Err(anyhow!("could not request launch to server: {err}"));
+                },
+            },
+            Ok(code) => return Ok(LaunchResult::LaunchRequested(code)),
+        }
     }
 }
 
@@ -224,9 +237,20 @@ pub fn request_launch(
 
     let mut buf_reader = BufReader::new(&mut stream);
     let mut resp = String::new();
-    buf_reader
+    let len = buf_reader
         .read_line(&mut resp)
         .map_err(LaunchError::Connection)?;
+    if len == 0 {
+        // The connection was closed before the server answered, so the
+        // request was never handled. This happens when libkrun accepts the
+        // connection but the guest server isn't listening (anymore), i.e.
+        // while the VM is booting or shutting down.
+        return Err(LaunchError::Connection(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "connection closed before the server replied",
+        ))
+        .into());
+    }
 
     if resp == "OK" {
         Ok(())
