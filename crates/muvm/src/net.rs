@@ -1,4 +1,4 @@
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
@@ -83,6 +83,14 @@ where
 }
 
 pub fn start_passt(publish_ports: &[String], passt_args: &[String]) -> Result<UnixStream> {
+    spawn_passt("passt", publish_ports, passt_args)
+}
+
+fn spawn_passt(
+    program: &str,
+    publish_ports: &[String],
+    passt_args: &[String],
+) -> Result<UnixStream> {
     // SAFETY: The child process should not inherit the file descriptor of
     // `parent_socket`. There is no documented guarantee of this, but the
     // implementation as of writing atomically sets `SOCK_CLOEXEC`.
@@ -103,12 +111,9 @@ pub fn start_passt(publish_ports: &[String], passt_args: &[String]) -> Result<Un
 
     debug!(fd = child_fd.as_raw_fd(); "passing fd to passt");
 
-    let mut cmd = Command::new("passt");
-    // SAFETY: `child_fd` is an `OwnedFd` and consumed to prevent closing on drop,
-    // as it will now be owned by the child process.
-    // See https://doc.rust-lang.org/std/io/index.html#io-safety
+    let mut cmd = Command::new(program);
     cmd.args(["-q", "-f", "--fd"])
-        .arg(format!("{}", child_fd.into_raw_fd()));
+        .arg(format!("{}", child_fd.as_raw_fd()));
     for spec in publish_ports {
         cmd.args(PublishSpec::parse(spec)?.to_args());
     }
@@ -116,9 +121,42 @@ pub fn start_passt(publish_ports: &[String], passt_args: &[String]) -> Result<Un
         cmd.arg(arg);
     }
     let child = cmd.spawn();
+
+    // The child has its own copy of `child_fd` now. Close ours: as long as we
+    // hold the other end of the socket pair, libkrun never sees it hang up when
+    // passt exits, and networking silently stops instead.
+    drop(child_fd);
+
     if let Err(err) = child {
         return Err(err).context("Failed to execute `passt` as child process");
     }
 
     Ok(parent_socket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{ErrorKind, Read};
+    use std::time::Duration;
+
+    #[test]
+    fn socket_hangs_up_when_passt_exits() {
+        // `true` ignores the passt arguments and exits, closing its end.
+        let mut socket = spawn_passt("true", &[], &[]).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 1];
+        match socket.read(&mut buf) {
+            Ok(0) => {},
+            Ok(n) => panic!("unexpected {n} bytes from the child"),
+            Err(err)
+                if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut =>
+            {
+                panic!("no hangup: the parent still holds the child's end of the socket pair")
+            },
+            Err(err) => panic!("read failed: {err}"),
+        }
+    }
 }
