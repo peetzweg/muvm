@@ -12,7 +12,14 @@ use crate::utils::env::find_in_path;
 
 /// Automatically pass these environment variables to the microVM, if they are
 /// set.
-const WELL_KNOWN_ENV_VARS: [&str; 20] = [
+const WELL_KNOWN_ENV_VARS: [&str; 26] = [
+    // GDK_*, QT_* and XCURSOR_*: guest apps draw on the host's X server
+    // through the X11 bridge, so the host's X11 scale and cursor settings
+    // apply to them unchanged. Without them, apps render at 1x on HiDPI setups
+    // where the compositor leaves X11 scaling to the clients (e.g. Hyprland
+    // with `xwayland:force_zero_scaling`), and guess their own cursor size.
+    "GDK_DPI_SCALE",
+    "GDK_SCALE",
     "LANG",
     "LC_ADDRESS",
     "LC_ALL",
@@ -31,7 +38,11 @@ const WELL_KNOWN_ENV_VARS: [&str; 20] = [
     "LIBGL_DRIVERS_PATH",
     "MESA_LOADER_DRIVER_OVERRIDE", // needed for asahi
     "PATH",                        // needed by `muvm-guest` program
+    "QT_SCALE_FACTOR",
+    "QT_SCREEN_SCALE_FACTORS",
     "RUST_LOG",
+    "XCURSOR_SIZE",
+    "XCURSOR_THEME",
     "XMODIFIERS",
 ];
 
