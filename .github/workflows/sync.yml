@@ -1,0 +1,66 @@
+name: Rebase fixes onto upstream
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM: https://github.com/AsahiLinux/muvm.git
+  FIX_BRANCHES: relaunch-race env-hidpi passt-fd-leak
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: omarchy-mac
+
+      - name: Rebase fix branches and rebuild omarchy-mac
+        id: rebase
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch -q upstream main
+          git fetch -q origin $(for b in $FIX_BRANCHES; do echo "+$b:refs/remotes/origin/$b"; done)
+          failed=""
+          for b in $FIX_BRANCHES; do
+            git checkout -q -B "$b" "origin/$b"
+            if ! git rebase -q upstream/main; then
+              git rebase --abort; failed="$failed $b"
+            fi
+          done
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+          [ -z "$failed" ] || exit 1
+          git checkout -q -B omarchy-mac upstream/main
+          for b in $FIX_BRANCHES; do
+            git cherry-pick upstream/main.."$b"
+          done
+          echo "upstream=$(git rev-parse --short upstream/main)" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update && sudo apt-get -y install libclang-dev libudev-dev
+          sudo curl -fsSo /usr/include/libkrun.h https://raw.githubusercontent.com/libkrun/libkrun/refs/heads/stable-1.19.x/include/libkrun.h
+          printf 'prefix=/usr\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: libkrun\nDescription: libkrun\nVersion: 1.19.0\nLibs: -L${libdir} -lkrun\nCflags: -I${includedir}\n' | sudo tee /usr/lib/x86_64-linux-gnu/pkgconfig/libkrun.pc >/dev/null
+
+      - name: Check that it compiles
+        run: cargo check --all-targets
+
+      - name: Push rebased branches
+        run: git push -f origin $FIX_BRANCHES omarchy-mac
+
+      - name: Open an issue on conflict
+        if: failure() && steps.rebase.outputs.failed != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create -R "$GITHUB_REPOSITORY" \
+            --title "Rebase onto upstream failed:${{ steps.rebase.outputs.failed }}" \
+            --body "The weekly rebase onto AsahiLinux/muvm main failed for:${{ steps.rebase.outputs.failed }}. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
